@@ -49,7 +49,10 @@ final class MarkdownSourceLoaderTests: XCTestCase {
 
         XCTAssertEqual(opened.url, url)
         XCTAssertEqual(opened.source, original)
-        XCTAssertEqual(opened.suggestedTitle, "notes")
+        XCTAssertEqual(
+            opened.suggestedTitle,
+            url.deletingPathExtension().lastPathComponent
+        )
         XCTAssertEqual(saved.url, url)
         XCTAssertEqual(saved.source, updated)
         XCTAssertTrue(saved.diskData.starts(with: Data([0xEF, 0xBB, 0xBF])))
