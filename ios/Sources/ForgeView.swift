@@ -48,6 +48,8 @@ struct ForgeView: View {
     @State private var pendingDocument: MarkdownSourceDocument?
     @State private var confirmingNewDocument = false
     @State private var confirmingRevert = false
+    @State private var attemptedDocumentRestoration = false
+    @State private var showingRestorationConflict = false
 
     init() {
         let requested = ProcessInfo.processInfo.environment["FMD_INITIAL_LANE"]
@@ -68,6 +70,9 @@ struct ForgeView: View {
             .onChange(of: uiTextScale) { _, value in
                 let clamped = Lab.clampedTextScale(value)
                 if clamped != value { uiTextScale = clamped }
+            }
+            .onChange(of: renderer.draftRecoveryIsComplete, initial: true) { _, isComplete in
+                if isComplete { restoreActiveDocumentAfterLaunch() }
             }
             .preferredColorScheme((LabAppearance(rawValue: appearance) ?? .dark).colorScheme)
     }
@@ -106,6 +111,9 @@ struct ForgeView: View {
         forgeLayout
         .onChange(of: renderer.source) { _, _ in
             renderer.scheduleRender()
+            renderer.scheduleDraftSave()
+        }
+        .onChange(of: renderer.documentIdentity) { _, _ in
             renderer.scheduleDraftSave()
         }
         .onChange(of: renderer.fontFamily) { _, _ in
@@ -269,6 +277,21 @@ struct ForgeView: View {
         } message: {
             Text("This replaces the current edits with the latest version from Files.")
         }
+        .alert("Recovered Edits Need Attention", isPresented: $showingRestorationConflict) {
+            Button("Keep Editing", role: .cancel) {}
+            Button("Save Recovered Copy…") {
+                beginSourceExport(.saveCopy)
+            }
+            Button("Use File Version", role: .destructive) {
+                reloadCurrentDocument()
+            }
+        } message: {
+            Text(
+                "FrankenMarkdown could not safely combine this recovered draft with "
+                    + "\(documentSession.displayName). The file may also have changed. "
+                    + "In-place Save is paused so neither version is overwritten."
+            )
+        }
     }
 
     private var forgePresentation: some View {
@@ -377,6 +400,7 @@ struct ForgeView: View {
                 }
                 .disabled(
                     documentSession.isSaving
+                        || documentSession.attention != nil
                         || (documentSession.hasCurrentDocument
                             && !documentSession.isDirty(source: renderer.source))
                 )
@@ -891,6 +915,7 @@ struct ForgeView: View {
     private func newSourceDocument() {
         let source = "# New Document\n\nStart writing..."
         documentSession.beginUntitled(source: source)
+        renderer.documentIdentity = nil
         renderer.source = source
         renderer.documentTitle = ""
         renderer.allowRawHtml = false
@@ -928,10 +953,65 @@ struct ForgeView: View {
         }
     }
 
-    private func adopt(_ document: MarkdownSourceDocument) {
-        documentSession.adopt(document)
+    private func adopt(
+        _ document: MarkdownSourceDocument,
+        documentIdentity: UUID = UUID()
+    ) {
+        documentSession.adopt(document, documentIdentity: documentIdentity)
+        renderer.documentIdentity = documentIdentity
         renderer.source = document.source
         renderer.documentTitle = document.suggestedTitle
+        renderer.allowRawHtml = false
+        lane = .write
+        sourceImportError = nil
+        documentError = nil
+    }
+
+    private func restoreActiveDocumentAfterLaunch() {
+        guard !attemptedDocumentRestoration else { return }
+        attemptedDocumentRestoration = true
+        Task {
+            do {
+                let recoveredSource = renderer.draftWasRecovered ? renderer.source : nil
+                switch try await documentSession.restoreActiveDocument(
+                    recoveredSource: recoveredSource,
+                    recoveredDocumentIdentity: renderer.documentIdentity
+                ) {
+                case .none:
+                    break
+                case .fileVersion(let restored):
+                    adopt(restored.document, documentIdentity: restored.documentIdentity)
+                case .recoveredEdits(let restored):
+                    adoptRecoveredEdits(from: restored, changedOnDisk: false)
+                case .conflict(let restored):
+                    adoptRecoveredEdits(from: restored, changedOnDisk: true)
+                    showingRestorationConflict = true
+                case .unassociatedDraft(let restored):
+                    documentSession.adoptUnassociatedDraft(
+                        while: restored.document,
+                        documentIdentity: restored.documentIdentity
+                    )
+                    showingRestorationConflict = true
+                }
+            } catch {
+                sourceImportError = "Your recovered draft is still available, but "
+                    + "\(documentSession.displayName) could not be reopened: "
+                    + error.localizedDescription
+            }
+        }
+    }
+
+    private func adoptRecoveredEdits(
+        from restored: MarkdownRestoredDocument,
+        changedOnDisk: Bool
+    ) {
+        documentSession.adoptRecoveredEdits(
+            from: restored.document,
+            documentIdentity: restored.documentIdentity,
+            changedOnDisk: changedOnDisk
+        )
+        renderer.documentIdentity = restored.documentIdentity
+        renderer.documentTitle = restored.document.suggestedTitle
         renderer.allowRawHtml = false
         lane = .write
         sourceImportError = nil

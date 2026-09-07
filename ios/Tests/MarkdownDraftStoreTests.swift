@@ -36,6 +36,7 @@ final class MarkdownDraftStoreTests: XCTestCase {
         let draft = MarkdownActiveDraft(
             schema: MarkdownActiveDraft.currentSchema,
             savedAtMilliseconds: 1,
+            documentIdentity: nil,
             source: "# Safe",
             title: "",
             author: "",
@@ -90,12 +91,22 @@ final class MarkdownDraftStoreTests: XCTestCase {
         XCTAssertNil(restored.pdfBaseFontSize)
     }
 
+    func testDocumentIdentityRoundTripsWithRecoveredDraft() throws {
+        let store = makeStore()
+        let documentIdentity = UUID()
+
+        try store.save(makeDraft(source: "# Identified draft", documentIdentity: documentIdentity))
+
+        XCTAssertEqual(store.load()?.documentIdentity, documentIdentity)
+    }
+
     func testOversizedCustomStylesheetIsRefused() {
         let store = makeStore()
         let original = makeDraft(source: "# Styled")
         let draft = MarkdownActiveDraft(
             schema: original.schema,
             savedAtMilliseconds: original.savedAtMilliseconds,
+            documentIdentity: original.documentIdentity,
             source: original.source,
             title: original.title,
             author: original.author,
@@ -129,10 +140,14 @@ final class MarkdownDraftStoreTests: XCTestCase {
             .appendingPathComponent("active-draft.json"))
     }
 
-    private func makeDraft(source: String) -> MarkdownActiveDraft {
+    private func makeDraft(
+        source: String,
+        documentIdentity: UUID? = nil
+    ) -> MarkdownActiveDraft {
         MarkdownActiveDraft(
             schema: MarkdownActiveDraft.currentSchema,
             savedAtMilliseconds: 1_725_350_400_000,
+            documentIdentity: documentIdentity,
             source: source,
             title: "Recovered",
             author: "Author",

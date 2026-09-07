@@ -43,6 +43,7 @@ struct MarkdownDocumentStatusBar: View {
             .foregroundStyle(Lab.onEmerald)
             .disabled(
                 session.isSaving
+                    || session.attention != nil
                     || (session.hasCurrentDocument && !session.isDirty(source: source))
             )
             .accessibilityLabel(session.hasCurrentDocument ? "Save" : "Save new Markdown file")
@@ -67,6 +68,7 @@ struct MarkdownDocumentStatusBar: View {
 
     private var statusText: String {
         if session.attention == .changedOnDisk { return "CHANGED ON DISK" }
+        if session.attention == .recoveryConflict { return "RECOVERY CONFLICT" }
         if session.attention == .unavailable { return "FILE UNAVAILABLE" }
         if session.isSaving { return "SAVING" }
         if session.isDirty(source: source) {

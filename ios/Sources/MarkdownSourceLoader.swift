@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -47,31 +48,61 @@ struct MarkdownRecentDocument: Codable, Equatable, Identifiable, Sendable {
     let lastOpenedAt: Date
 }
 
+private struct MarkdownActiveDocumentReference: Codable, Equatable, Sendable {
+    let documentIdentity: UUID
+    let bookmarkData: Data
+    let displayName: String
+    let baselineSourceDigest: Data
+    let baselineDiskDigest: Data
+}
+
+struct MarkdownRestoredDocument: Equatable, Sendable {
+    let document: MarkdownSourceDocument
+    let documentIdentity: UUID
+}
+
+enum MarkdownDocumentRestoration: Equatable, Sendable {
+    case none
+    case fileVersion(MarkdownRestoredDocument)
+    case recoveredEdits(MarkdownRestoredDocument)
+    case conflict(MarkdownRestoredDocument)
+    case unassociatedDraft(MarkdownRestoredDocument)
+}
+
 enum MarkdownDocumentAttention: Equatable {
     case changedOnDisk
+    case recoveryConflict
     case unavailable
 }
 
 @MainActor
 final class MarkdownDocumentSession: ObservableObject {
     static let recentsStorageKey = "frankenmarkdown.recentSourceDocuments.v1"
+    static let activeDocumentStorageKey = "frankenmarkdown.activeSourceDocument.v1"
     static let maximumRecentDocuments = 6
 
     @Published private(set) var currentDocument: MarkdownSourceDocument?
     @Published private(set) var recentDocuments: [MarkdownRecentDocument]
     @Published private(set) var isSaving = false
     @Published private(set) var attention: MarkdownDocumentAttention?
+    @Published private(set) var currentDocumentIdentity: UUID?
 
     private var untitledBaseline: String
+    private var activeDocumentReference: MarkdownActiveDocumentReference?
+    private var restorationDisplayName: String?
     private let defaults: UserDefaults
 
     init(initialSource: String, defaults: UserDefaults = .standard) {
         untitledBaseline = initialSource
         self.defaults = defaults
         recentDocuments = Self.loadRecents(from: defaults)
+        activeDocumentReference = Self.loadActiveDocument(from: defaults)
+        restorationDisplayName = activeDocumentReference?.displayName
     }
 
-    var displayName: String { currentDocument?.displayName ?? "Untitled.md" }
+    var displayName: String {
+        currentDocument?.displayName ?? restorationDisplayName ?? "Untitled.md"
+    }
     var hasCurrentDocument: Bool { currentDocument != nil }
 
     func isDirty(source: String) -> Bool {
@@ -80,14 +111,80 @@ final class MarkdownDocumentSession: ObservableObject {
 
     func beginUntitled(source: String) {
         currentDocument = nil
+        currentDocumentIdentity = nil
         untitledBaseline = source
         attention = nil
+        restorationDisplayName = nil
+        activeDocumentReference = nil
+        defaults.removeObject(forKey: Self.activeDocumentStorageKey)
     }
 
-    func adopt(_ document: MarkdownSourceDocument) {
+    func adopt(
+        _ document: MarkdownSourceDocument,
+        documentIdentity: UUID = UUID()
+    ) {
         currentDocument = document
+        currentDocumentIdentity = documentIdentity
         attention = nil
+        restorationDisplayName = nil
+        recordActive(document, documentIdentity: documentIdentity)
         recordRecent(document)
+    }
+
+    func adoptRecoveredEdits(
+        from document: MarkdownSourceDocument,
+        documentIdentity: UUID,
+        changedOnDisk: Bool
+    ) {
+        currentDocument = document
+        currentDocumentIdentity = documentIdentity
+        attention = changedOnDisk ? .changedOnDisk : nil
+        restorationDisplayName = nil
+        if !changedOnDisk {
+            recordActive(document, documentIdentity: documentIdentity)
+        }
+    }
+
+    func adoptUnassociatedDraft(
+        while retaining: MarkdownSourceDocument,
+        documentIdentity: UUID
+    ) {
+        currentDocument = retaining
+        currentDocumentIdentity = documentIdentity
+        attention = .recoveryConflict
+        restorationDisplayName = nil
+    }
+
+    func restoreActiveDocument(
+        recoveredSource: String?,
+        recoveredDocumentIdentity: UUID?
+    ) async throws -> MarkdownDocumentRestoration {
+        guard let reference = activeDocumentReference else { return .none }
+        do {
+            let url = try MarkdownSourceLoader.resolveBookmark(reference.bookmarkData)
+            let document = try await MarkdownSourceLoader.open(from: url)
+            let restored = MarkdownRestoredDocument(
+                document: document,
+                documentIdentity: reference.documentIdentity
+            )
+            guard let recoveredSource else { return .fileVersion(restored) }
+            guard recoveredDocumentIdentity == reference.documentIdentity else {
+                return .unassociatedDraft(restored)
+            }
+
+            let recoveredSourceDigest = Self.digest(Data(recoveredSource.utf8))
+            if recoveredSourceDigest == reference.baselineSourceDigest {
+                return .fileVersion(restored)
+            }
+            if Self.digest(document.diskData) == reference.baselineDiskDigest {
+                return .recoveredEdits(restored)
+            }
+            return .conflict(restored)
+        } catch {
+            attention = .unavailable
+            restorationDisplayName = reference.displayName
+            throw error
+        }
     }
 
     func openRecent(_ recent: MarkdownRecentDocument) async throws -> MarkdownSourceDocument {
@@ -97,6 +194,12 @@ final class MarkdownDocumentSession: ObservableObject {
 
     func save(source: String) async throws {
         guard let currentDocument else { throw MarkdownSourceLoader.DocumentError.noCurrentDocument }
+        if attention == .changedOnDisk {
+            throw MarkdownSourceLoader.DocumentError.changedOnDisk
+        }
+        if attention == .recoveryConflict {
+            throw MarkdownSourceLoader.DocumentError.recoveryConflict
+        }
         guard !isSaving else { return }
         isSaving = true
         defer { isSaving = false }
@@ -104,6 +207,10 @@ final class MarkdownDocumentSession: ObservableObject {
             let saved = try await MarkdownSourceLoader.save(source, replacing: currentDocument)
             self.currentDocument = saved
             attention = nil
+            recordActive(
+                saved,
+                documentIdentity: currentDocumentIdentity ?? UUID()
+            )
             recordRecent(saved)
         } catch {
             if error as? MarkdownSourceLoader.DocumentError == .changedOnDisk {
@@ -136,6 +243,23 @@ final class MarkdownDocumentSession: ObservableObject {
         }
     }
 
+    private func recordActive(
+        _ document: MarkdownSourceDocument,
+        documentIdentity: UUID
+    ) {
+        let reference = MarkdownActiveDocumentReference(
+            documentIdentity: documentIdentity,
+            bookmarkData: document.bookmarkData,
+            displayName: document.displayName,
+            baselineSourceDigest: Self.digest(Data(document.source.utf8)),
+            baselineDiskDigest: Self.digest(document.diskData)
+        )
+        activeDocumentReference = reference
+        if let encoded = try? JSONEncoder().encode(reference) {
+            defaults.set(encoded, forKey: Self.activeDocumentStorageKey)
+        }
+    }
+
     private func represents(_ recent: MarkdownRecentDocument, url: URL) -> Bool {
         guard let recentURL = try? MarkdownSourceLoader.resolveBookmark(recent.bookmarkData) else {
             return false
@@ -149,6 +273,17 @@ final class MarkdownDocumentSession: ObservableObject {
             return []
         }
         return Array(decoded.prefix(maximumRecentDocuments))
+    }
+
+    private static func loadActiveDocument(
+        from defaults: UserDefaults
+    ) -> MarkdownActiveDocumentReference? {
+        guard let data = defaults.data(forKey: activeDocumentStorageKey) else { return nil }
+        return try? JSONDecoder().decode(MarkdownActiveDocumentReference.self, from: data)
+    }
+
+    private static func digest(_ data: Data) -> Data {
+        Data(SHA256.hash(data: data))
     }
 
     private static func isUnavailableFileError(_ error: Error) -> Bool {
@@ -187,6 +322,7 @@ enum MarkdownSourceLoader {
     enum DocumentError: LocalizedError, Equatable {
         case noCurrentDocument
         case changedOnDisk
+        case recoveryConflict
         case coordinatedRead
         case coordinatedWrite
         case savedCopyMismatch
@@ -197,6 +333,8 @@ enum MarkdownSourceLoader {
                 "Choose where to save this new Markdown document."
             case .changedOnDisk:
                 "This file changed in another app. Reopen it before saving, or use Save a Copy to keep your edits."
+            case .recoveryConflict:
+                "This recovered draft could not be safely matched to the last file. Use Save a Copy or reopen the file."
             case .coordinatedRead:
                 "The document provider could not coordinate a safe read of this file."
             case .coordinatedWrite:

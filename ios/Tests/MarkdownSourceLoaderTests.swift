@@ -121,6 +121,131 @@ final class MarkdownSourceLoaderTests: XCTestCase {
         XCTAssertEqual(try await restored.openRecent(recent).source, "# Recent\n")
     }
 
+    @MainActor
+    func testSessionRestoresActiveFileWhenThereIsNoRecoveredDraft() async throws {
+        let defaults = try makeDefaults()
+        let original = "# Original\n"
+        let url = try temporarySourceURL(contents: Data(original.utf8))
+        let firstSession = MarkdownDocumentSession(initialSource: "# Untitled\n", defaults: defaults)
+        firstSession.adopt(try await MarkdownSourceLoader.open(from: url))
+        try Data("# Updated elsewhere\n".utf8).write(to: url, options: .atomic)
+
+        let restoredSession = MarkdownDocumentSession(initialSource: "# Untitled\n", defaults: defaults)
+        let restoration = try await restoredSession.restoreActiveDocument(
+            recoveredSource: nil,
+            recoveredDocumentIdentity: nil
+        )
+
+        guard case .fileVersion(let restored) = restoration else {
+            return XCTFail("A launch without recovered edits should use the current file version")
+        }
+        XCTAssertEqual(restored.document.source, "# Updated elsewhere\n")
+    }
+
+    @MainActor
+    func testSessionReconnectsRecoveredEditsWhenFileIsUnchanged() async throws {
+        let defaults = try makeDefaults()
+        let original = "# Original\n"
+        let recovered = "# Original\n\nRecovered paragraph.\n"
+        let url = try temporarySourceURL(contents: Data(original.utf8))
+        let firstSession = MarkdownDocumentSession(initialSource: "# Untitled\n", defaults: defaults)
+        firstSession.adopt(try await MarkdownSourceLoader.open(from: url))
+        let documentIdentity = try XCTUnwrap(firstSession.currentDocumentIdentity)
+
+        let restoredSession = MarkdownDocumentSession(initialSource: "# Untitled\n", defaults: defaults)
+        let restoration = try await restoredSession.restoreActiveDocument(
+            recoveredSource: recovered,
+            recoveredDocumentIdentity: documentIdentity
+        )
+        guard case .recoveredEdits(let restored) = restoration else {
+            return XCTFail("Recovered edits should reconnect to an unchanged file")
+        }
+        restoredSession.adoptRecoveredEdits(
+            from: restored.document,
+            documentIdentity: restored.documentIdentity,
+            changedOnDisk: false
+        )
+
+        XCTAssertTrue(restoredSession.hasCurrentDocument)
+        XCTAssertTrue(restoredSession.isDirty(source: recovered))
+        XCTAssertNil(restoredSession.attention)
+    }
+
+    @MainActor
+    func testSessionRefusesInPlaceSaveAfterTwoSidedRestorationConflict() async throws {
+        let defaults = try makeDefaults()
+        let original = "# Original\n"
+        let external = "# External edit\n"
+        let recovered = "# Recovered local edit\n"
+        let url = try temporarySourceURL(contents: Data(original.utf8))
+        let firstSession = MarkdownDocumentSession(initialSource: "# Untitled\n", defaults: defaults)
+        firstSession.adopt(try await MarkdownSourceLoader.open(from: url))
+        let documentIdentity = try XCTUnwrap(firstSession.currentDocumentIdentity)
+        try Data(external.utf8).write(to: url, options: .atomic)
+
+        let restoredSession = MarkdownDocumentSession(initialSource: "# Untitled\n", defaults: defaults)
+        let restoration = try await restoredSession.restoreActiveDocument(
+            recoveredSource: recovered,
+            recoveredDocumentIdentity: documentIdentity
+        )
+        guard case .conflict(let restored) = restoration else {
+            return XCTFail("Two changed versions must produce an explicit restoration conflict")
+        }
+        restoredSession.adoptRecoveredEdits(
+            from: restored.document,
+            documentIdentity: restored.documentIdentity,
+            changedOnDisk: true
+        )
+
+        do {
+            try await restoredSession.save(source: recovered)
+            XCTFail("In-place Save must stay blocked while the restoration conflict is unresolved")
+        } catch {
+            XCTAssertEqual(error as? MarkdownSourceLoader.DocumentError, .changedOnDisk)
+        }
+        XCTAssertEqual(try MarkdownSourceLoader.decode(Data(contentsOf: url)), external)
+    }
+
+    @MainActor
+    func testBeginningUntitledClearsAutomaticDocumentRestoration() async throws {
+        let defaults = try makeDefaults()
+        let url = try temporarySourceURL(contents: Data("# Stored\n".utf8))
+        let firstSession = MarkdownDocumentSession(initialSource: "# Untitled\n", defaults: defaults)
+        firstSession.adopt(try await MarkdownSourceLoader.open(from: url))
+        firstSession.beginUntitled(source: "# New\n")
+
+        let restoredSession = MarkdownDocumentSession(initialSource: "# Untitled\n", defaults: defaults)
+        XCTAssertEqual(
+            try await restoredSession.restoreActiveDocument(
+                recoveredSource: "# New\n",
+                recoveredDocumentIdentity: nil
+            ),
+            .none
+        )
+    }
+
+    @MainActor
+    func testSessionDoesNotAttachDraftFromAnotherDocument() async throws {
+        let defaults = try makeDefaults()
+        let url = try temporarySourceURL(contents: Data("# Current file\n".utf8))
+        let firstSession = MarkdownDocumentSession(initialSource: "# Untitled\n", defaults: defaults)
+        firstSession.adopt(try await MarkdownSourceLoader.open(from: url))
+
+        let restoredSession = MarkdownDocumentSession(initialSource: "# Untitled\n", defaults: defaults)
+        let restoration = try await restoredSession.restoreActiveDocument(
+            recoveredSource: "# Draft from a different file\n",
+            recoveredDocumentIdentity: UUID()
+        )
+
+        guard case .unassociatedDraft = restoration else {
+            return XCTFail("A draft with another identity must never attach to the active file")
+        }
+    }
+
+    private func makeDefaults() throws -> UserDefaults {
+        try XCTUnwrap(UserDefaults(suiteName: "MarkdownRestorationTests.\(UUID().uuidString)"))
+    }
+
     private func temporarySourceURL(contents: Data, name: String = "notes.md") throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("frankenmarkdown-tests-\(UUID().uuidString)-\(name)")

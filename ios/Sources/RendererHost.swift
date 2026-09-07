@@ -185,6 +185,7 @@ struct RenderedArtifact: Decodable {
 @MainActor
 final class MarkdownRendererModel: NSObject, ObservableObject {
     @Published var source = MarkdownRendererModel.sample
+    @Published var documentIdentity: UUID?
     @Published var fontFamily = "sans"
     @Published var darkMode = "auto"
     @Published var allowRawHtml = false
@@ -211,6 +212,8 @@ final class MarkdownRendererModel: NSObject, ObservableObject {
     @Published private(set) var outputBytes = 0
     @Published private(set) var diagnosticCount = 0
     @Published private(set) var draftStatus = "Checking local recovery…"
+    @Published private(set) var draftRecoveryIsComplete = false
+    @Published private(set) var draftWasRecovered = false
 
     let webView: WKWebView
     private var requestID = 0
@@ -356,6 +359,7 @@ final class MarkdownRendererModel: NSObject, ObservableObject {
         MarkdownActiveDraft(
             schema: MarkdownActiveDraft.currentSchema,
             savedAtMilliseconds: Int64((now.timeIntervalSince1970 * 1_000).rounded()),
+            documentIdentity: documentIdentity,
             source: source,
             title: documentTitle,
             author: documentAuthor,
@@ -383,12 +387,16 @@ final class MarkdownRendererModel: NSObject, ObservableObject {
             guard let self else { return }
             guard self.source == Self.sample, self.documentTitle.isEmpty else {
                 self.draftStatus = "Active draft changed"
+                self.draftRecoveryIsComplete = true
                 return
             }
             guard let draft else {
                 self.draftStatus = "Local recovery ready"
+                self.draftRecoveryIsComplete = true
                 return
             }
+            self.draftWasRecovered = true
+            self.documentIdentity = draft.documentIdentity
             self.source = draft.source
             self.documentTitle = draft.title
             self.documentAuthor = draft.author
@@ -407,11 +415,13 @@ final class MarkdownRendererModel: NSObject, ObservableObject {
             self.pdfTableFontSize = draft.pdfTableFontSize ?? 10
             self.customCSS = draft.customCSS ?? ""
             self.draftStatus = "Recovered local draft"
+            self.draftRecoveryIsComplete = true
         }
     }
 
     private func matchesCurrentDraft(_ draft: MarkdownActiveDraft) -> Bool {
         draft.source == source &&
+            draft.documentIdentity == documentIdentity &&
             draft.title == documentTitle &&
             draft.author == documentAuthor &&
             draft.fontFamily == fontFamily &&

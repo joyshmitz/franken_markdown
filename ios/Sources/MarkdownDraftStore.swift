@@ -6,6 +6,7 @@ struct MarkdownActiveDraft: Codable, Equatable, Sendable {
 
     let schema: Int
     let savedAtMilliseconds: Int64
+    let documentIdentity: UUID?
     let source: String
     let title: String
     let author: String
