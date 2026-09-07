@@ -118,7 +118,8 @@ final class MarkdownSourceLoaderTests: XCTestCase {
         let restored = MarkdownDocumentSession(initialSource: initial, defaults: defaults)
         XCTAssertEqual(restored.recentDocuments, session.recentDocuments)
         let recent = try XCTUnwrap(restored.recentDocuments.first)
-        XCTAssertEqual(try await restored.openRecent(recent).source, "# Recent\n")
+        let reopened = try await restored.openRecent(recent)
+        XCTAssertEqual(reopened.source, "# Recent\n")
     }
 
     @MainActor
@@ -215,13 +216,11 @@ final class MarkdownSourceLoaderTests: XCTestCase {
         firstSession.beginUntitled(source: "# New\n")
 
         let restoredSession = MarkdownDocumentSession(initialSource: "# Untitled\n", defaults: defaults)
-        XCTAssertEqual(
-            try await restoredSession.restoreActiveDocument(
-                recoveredSource: "# New\n",
-                recoveredDocumentIdentity: nil
-            ),
-            .none
+        let restoration = try await restoredSession.restoreActiveDocument(
+            recoveredSource: "# New\n",
+            recoveredDocumentIdentity: nil
         )
+        XCTAssertEqual(restoration, .none)
     }
 
     @MainActor
