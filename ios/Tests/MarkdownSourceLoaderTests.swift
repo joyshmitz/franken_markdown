@@ -249,8 +249,10 @@ final class MarkdownSourceLoaderTests: XCTestCase {
     }
 
     private func temporarySourceURL(contents: Data, name: String = "notes.md") throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("frankenmarkdown-tests-\(UUID().uuidString)-\(name)")
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("frankenmarkdown-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent(name, isDirectory: false)
         try contents.write(to: url, options: .atomic)
         return url
     }
