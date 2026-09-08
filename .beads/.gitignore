@@ -1,5 +1,6 @@
 .write.lock
 .sync.lock
+*.lock
 last-touched
 *.tmp
 *.db-wal
